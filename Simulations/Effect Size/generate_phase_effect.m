@@ -104,7 +104,6 @@ phasecounter = zeros(nbins_analysis,1);
 phasetrials = zeros(no_trials_bin,4);
 total_effect_analysed = zeros(nbins_analysis,1);
 
-% rng('shuffle');
 if mode == 1 %% randomly selected phases
     
     for trial = 1:no_trials_bin
@@ -183,6 +182,10 @@ for p = 1:nbins_analysis
     total_effect_analysed(p) = total_effect_analysed(p)./phasecounter(p);
 end
 
+%% Calculate area under curve (AUC)
+% set scores below 0.5 to 0.5 so that areas below the offset are not
+% included in AUC calculation.
+% Use trapz function to calculate AUC
 A = total_effect_analysed;
-A(A < .5) = 0;
+A(A < .5) = 0.5;
 AUC = trapz(A);
