@@ -150,4 +150,4 @@ parfor nSubs = 1:length(no_subjs)
     end
 end
 
-save all_simulations_binary.mat
+save sims_for_power.mat
