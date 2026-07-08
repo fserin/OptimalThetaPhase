@@ -1,0 +1,595 @@
+---
+title: "OptimalPhaseAnalyes"
+author: "Fatih Serin"
+date: "2026-04-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ggplot2)
+theme_set(theme_bw(base_size = 13, base_family = "Arial"))
+options(
+  ggplot2.discrete.colour = function(...) scale_colour_grey(...),
+  ggplot2.discrete.fill   = function(...) scale_fill_grey(...),
+  ggplot2.continuous.colour = function(...) scale_colour_gradient(low = "grey80", high = "black", ...),
+  ggplot2.continuous.fill   = function(...) scale_fill_gradient(low = "grey80", high = "black", ...)
+)
+```
+
+```{r Load data and perform chance-level rejection analysis, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(car)
+library(lme4)
+library(emmeans)
+library(poolr)
+library(BayesFactor)
+library(ggeffects)
+library(here)
+
+# Load anonymised data
+load("Data.RData")
+
+# Set the seed for reproducibility (affects all permutation / sampling below)
+set.seed(1996)
+
+
+# Participant Exclusion w/ Permutation ----------------------------------------
+PIDs <- unique(df_retrieval$ParticipantID)
+
+Feedbacks    <- data.frame()
+Exp4Data     <- data.frame()
+nIterations  <- 10000
+Includedlist <- vector()
+IncludedPIDs <- vector()
+ExcludedPIDs <- vector()
+
+for (iSub in 1:length(PIDs)) {
+
+  Excluded <- 0
+  NullDist <- data.frame(Acc = rep(NA, nIterations))
+
+  df_Sub_ret  <- df_retrieval[df_retrieval$ParticipantID == PIDs[iSub], ]
+  df_Sub_enc  <- df_encoding[df_encoding$ParticipantID   == PIDs[iSub], ]
+  df_Sub_surv <- df_survey[df_survey$ParticipantID       == PIDs[iSub], ]
+
+  for (i in 1:nIterations) {
+    Responses <- df_Sub_ret$response
+    Answers   <- sample(Responses)
+    NullDist[i, 1] <- (sum(Responses == Answers, na.rm = TRUE) / length(Responses)) * 100
+  }
+
+  # One-sided 95th percentile of the null = significance threshold (p < .05)
+  Significance_Threshold <- quantile(NullDist$Acc, 0.95, na.rm = TRUE)
+
+  # print(ggplot(NullDist, aes(x = Acc)) + geom_density(fill = "gray") +
+  #         geom_vline(xintercept = mean(df_Sub_ret$Accuracy, na.rm = TRUE) * 100,
+  #                    color = "green", linetype = "dashed", linewidth = 1) +
+  #         geom_vline(xintercept = Significance_Threshold,
+  #                    color = "red", linetype = "dashed", linewidth = 1) +
+  #         ggtitle(paste("Sub -", PIDs[iSub])))
+
+  df_Sub_sum <- df_Sub_ret |>
+    group_by(Condition) |>
+    summarise(
+      PropCorrect = mean(Accuracy, na.rm = TRUE),
+      n           = sum(!is.na(Accuracy)),
+      .groups     = "drop"
+    )
+
+  MissingEncoding  <- sum(is.na(df_Sub_enc$response))
+  MissingRetrieval <- sum(is.na(df_Sub_ret$response))
+
+  print(paste("ID = ", PIDs[iSub], ' missing responses. Encoding: ', MissingEncoding,
+              ' Retrieval: ', MissingRetrieval))
+
+  # ── Exclusion criteria ──────────────────────────────────────────────────────
+  if (mean(df_Sub_ret$Accuracy, na.rm = TRUE) * 100 <= Significance_Threshold) {
+    # Accuracy not above chance
+    print(paste("ID = ", PIDs[iSub], ' is at chance-level!'))
+    Excluded <- 1
+    ExcludedPIDs <- c(ExcludedPIDs, PIDs[iSub])
+  } else if (PIDs[iSub] == "267") {
+    # Participant admitted to not paying attention
+    Excluded <- 1
+    ExcludedPIDs <- c(ExcludedPIDs, PIDs[iSub])
+  } else if (min(df_Sub_sum$n) < 6) {
+    # At least one condition has fewer than half its trials
+    print(paste("Lowest trial N per condition: ", min(df_Sub_sum$n)))
+    Excluded <- 1
+    ExcludedPIDs <- c(ExcludedPIDs, PIDs[iSub])
+  } else {
+    # Included: record condition assignment and PID in parallel (one entry each;
+    # assumes exactly one ConditionID per participant).
+    Includedlist <- c(Includedlist, as.numeric(unique(df_Sub_ret$ConditionID)))
+    IncludedPIDs <- c(IncludedPIDs, PIDs[iSub])
+  }
+
+  # ── Survey / free-text feedback ─────────────────────────────────────────────
+  Strategy      <- as.vector(na.omit(unique(df_Sub_surv$response.Strategy)))
+  StrategyFreq  <- as.vector(na.omit(unique(df_Sub_surv$response.StrategyFreq)))
+
+  # Take the 2nd timing response if more than one was given, else the single one.
+  TimingResponses <- as.vector(na.omit(unique(df_Sub_surv$response.StrategyTiming)))
+  if (length(TimingResponses) > 1) {
+    StrategyTiming <- toString(TimingResponses[[2]])
+  } else {
+    StrategyTiming <- toString(TimingResponses)
+  }
+
+  OtherStrategy <- as.vector(na.omit(unique(df_Sub_surv$response.OtherStrategy)))
+  FreeFeedback  <- as.vector(na.omit(unique(df_Sub_surv$response.FreeFeedback)))
+  Seriousness   <- as.vector(na.omit(unique(df_Sub_surv$response.Seriousness)))
+  ConditionID   <- unique(df_Sub_ret$ConditionID)
+  SubID         <- iSub
+
+  if (is_empty(Strategy))       Strategy       <- NA
+  if (is_empty(StrategyFreq))   StrategyFreq   <- NA
+  if (is_empty(OtherStrategy))  OtherStrategy  <- NA
+  if (is_empty(FreeFeedback))   FreeFeedback   <- NA
+  if (is_empty(StrategyTiming)) StrategyTiming <- NA
+  if (is_empty(Seriousness))    Seriousness    <- NA
+
+  Feedback <- data.frame(SubID, ConditionID, Excluded, Strategy, StrategyFreq,
+                         StrategyTiming, OtherStrategy, FreeFeedback, Seriousness)
+
+  Feedbacks <- rbind(Feedbacks, Feedback)
+}
+
+missing_IDs <- setdiff(1:384, sort(as.numeric(Includedlist)))
+paste(missing_IDs, collapse = ', ')
+
+cat("Exclusion Rate: ", ((length(PIDs) - length(IncludedPIDs)) / length(PIDs)) * 100,
+    "%. ", (length(PIDs) - length(IncludedPIDs)), "out of ", length(PIDs))
+
+# Remove duplicate ConditionIDs, keeping the first instance of each.
+dups      <- which(duplicated(Includedlist))
+FinalList <- if (length(dups)) IncludedPIDs[-dups] else IncludedPIDs
+
+Exp4Data <- df_retrieval[df_retrieval$ParticipantID %in% FinalList, ]
+
+IncludeColumns <- c("rt", "response", "ConditionID", "TrialType", "ClipID",
+                    "BlockNum", "Condition", "SoundCategory", "CorrectKey",
+                    "Accuracy")
+
+Exp4Data <- Exp4Data[IncludeColumns]
+
+# Use ConditionID as the analysis-level ParticipantID
+names(Exp4Data)[names(Exp4Data) == 'ConditionID'] <- 'ParticipantID'
+
+write.csv(Exp4Data, here("Exp4Data.csv"), row.names = FALSE)
+
+# Sample characteristics: age. The Age question is the first survey-text item
+# (trial_type == "survey-text", trial_index == 1). Note: response is stored as
+# literal text, e.g. response = 'list(Age = "23")' (a character string, not an
+# actual R list), so we pull the quoted value out with a regex rather than
+# list-indexing it.
+Age <- df_survey |>
+  filter(trial_type == "survey-text", trial_index == 1) |>
+  mutate(Age = as.numeric(sub('.*Age\\s*=\\s*"([^"]*)".*', "\\1", response))) |>
+  filter(ParticipantID %in% FinalList) |>
+  group_by(ParticipantID) |>
+  summarise(Age = dplyr::first(Age, na_rm = TRUE), .groups = "drop") |>
+  pull(Age)
+
+cat("Age: M =", round(mean(Age, na.rm = TRUE), 2),
+    ", SD =", round(sd(Age, na.rm = TRUE), 2),
+    ", range =", paste(range(Age, na.rm = TRUE), collapse = "-"), "\n")
+
+```
+
+
+```{r Confirmatory Analysis}
+
+library(tidyverse)
+library(car)
+library(lme4)
+library(emmeans)
+library(poolr)
+library(BayesFactor)
+library(ggeffects)
+library(ggplot2)
+library(here)
+library(devEMF)
+
+theme_set(theme_bw(base_size = 13, base_family = "Arial"))
+options(
+  ggplot2.discrete.colour = function(...) scale_colour_grey(...),
+  ggplot2.discrete.fill   = function(...) scale_fill_grey(...),
+  ggplot2.continuous.colour = function(...) scale_colour_gradient(low = "grey80", high = "black", ...),
+  ggplot2.continuous.fill   = function(...) scale_fill_gradient(low = "grey80", high = "black", ...)
+)
+
+Exp4Data <- read.csv(here("Exp4Data.csv"))
+
+# Per-condition, per-participant accuracy (Accuracy still logical here → mean OK)
+Exp4Sum <- Exp4Data |>
+  group_by(Condition, ParticipantID) |>
+  summarise(
+    PropCorrect = mean(Accuracy, na.rm = TRUE),
+    n           = n(),
+    .groups     = "drop"
+  )
+
+Exp4Sum$Condition     <- as.numeric(Exp4Sum$Condition)
+Exp4Sum$Condition_rad <- Exp4Sum$Condition * (pi / 180)
+
+# Accuracy across blocks (for the learning-curve plot)
+BlockSummary <- Exp4Data |>
+  group_by(ParticipantID, BlockNum) |>
+  summarise(
+    PropCorrect = mean(Accuracy, na.rm = TRUE),
+    n           = n(),
+    .groups     = "drop"
+  )
+
+# Overall accuracy per participant (pooled over all trials)
+ParticipantSummary <- Exp4Data |>
+  group_by(ParticipantID) |>
+  summarise(
+    PropCorrect = mean(Accuracy, na.rm = TRUE),
+    n           = n(),
+    .groups     = "drop"
+  )
+
+cat("Overall accuracy: M =", round(mean(ParticipantSummary$PropCorrect, na.rm = TRUE), 3),
+    ", SD =", round(sd(ParticipantSummary$PropCorrect, na.rm = TRUE), 3), "\n")
+
+# Recode logical Accuracy (TRUE/FALSE) to 1/0, then to a factor for glm/glmer.
+Exp4Data$Accuracy[Exp4Data$Accuracy == TRUE]  <- 1
+Exp4Data$Accuracy[Exp4Data$Accuracy == FALSE] <- 0
+Exp4Data$Accuracy <- as.factor(Exp4Data$Accuracy)
+
+# Keep Condition in DEGREES (matches Exp4Sum) and add an explicit RADIAN column
+# for the circular/sinusoidal analyses.
+Exp4Data$Condition     <- as.numeric(Exp4Data$Condition)
+Exp4Data$Condition_rad <- Exp4Data$Condition * (pi / 180)
+
+# Learning curve across blocks
+p <- ggplot(BlockSummary, aes(x = BlockNum, y = PropCorrect,
+                              group = ParticipantID)) +
+  geom_line(linewidth = 0.6, alpha = 0.4, colour = "grey50") +
+  geom_point(size = 1.8, alpha = 0.4, colour = "grey50") +
+  stat_summary(aes(group = 1), fun = mean, geom = "line",
+               colour = "black", linewidth = 1.2) +
+  geom_hline(yintercept = 0.25, linetype = "dashed", colour = "grey50") +
+  scale_x_continuous(breaks = unique(BlockSummary$BlockNum)) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent_format()) +
+  labs(
+    title    = "Retrieval Accuracy Across Blocks",
+    subtitle = length(unique(Exp4Data$ParticipantID)),
+    x        = "Block Number",
+    y        = "Proportion Correct"
+  ) +
+  theme(legend.position = "none")
+
+print(p)
+
+# ── Plot: accuracy across conditions ──────────────────────────────────────────
+p_conditions <- ggplot(Exp4Sum, aes(x = Condition, y = PropCorrect,
+                         group = ParticipantID, colour = ParticipantID)) +
+  geom_line(linewidth = 0.6, alpha = 0.4, colour = "grey50") +
+  geom_point(size = 1.8, alpha = 0.4, colour = "grey50") +
+  stat_summary(aes(group = 1), fun = mean, geom = "line",
+               colour = "black", linewidth = 1.2) +
+  geom_hline(yintercept = 0.25, linetype = "dashed", colour = "grey50") +
+  scale_x_continuous(breaks = unique(Exp4Sum$Condition)) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent_format()) +
+  labs(
+    title    = "Memory Accuracy Across Phase Lags (chance level = 25%)",
+    x        = "Phase Lags (degrees)",
+    y        = "Proportion Correct"
+  ) +
+  theme_minimal(base_size = 13, base_family = "Arial") +
+  theme(legend.position = "none")
+
+print(p_conditions)
+
+# ── Per-subject sinusoidal logistic regression (test of phase modulation) ──────
+ParticipantIDs <- as.character(sort(as.numeric(unique(Exp4Data$ParticipantID))))
+n_subj         <- length(ParticipantIDs)
+
+logregress_ps   <- numeric(n_subj)
+logregress_Fs   <- numeric(n_subj)
+
+A_obs       <- numeric(n_subj)
+A_floor     <- numeric(n_subj)
+A_corrected <- numeric(n_subj)
+
+nIterations <- 1000 # permutation iterations for the amplitude null floor
+
+for (iSub in 1:length(ParticipantIDs)) {
+
+  subj_data <- Exp4Data[Exp4Data$ParticipantID == ParticipantIDs[iSub], ]
+  subj_data <- subj_data[!is.na(subj_data$Accuracy), ]
+
+  df <- data.frame(
+    Accuracy = as.numeric(as.character(subj_data$Accuracy)),
+    pred_sin = sin(subj_data$Condition_rad),   # phase in radians
+    pred_cos = cos(subj_data$Condition_rad)
+  )
+
+  g1 <- glm(Accuracy ~ pred_sin + pred_cos, data = df, family = binomial(link = "logit"))
+
+  # Wald F-test on the two sinusoidal terms (matches MATLAB's coefTest)
+  wald_result         <- linearHypothesis(g1, c("pred_sin = 0", "pred_cos = 0"), test = "F")
+  logregress_Fs[iSub] <- wald_result[2, "F"]
+  logregress_ps[iSub] <- wald_result[2, "Pr(>F)"]
+
+  # Observed modulation amplitude
+  b <- coef(g1)
+  A_obs[iSub] <- sqrt(b["pred_sin"]^2 + b["pred_cos"]^2)
+
+  # Permutation null floor: shuffle phase labels, keep Accuracy fixed
+  A_null <- numeric(nIterations)
+  for (iPerm in 1:nIterations) {
+    idx <- sample(nrow(df))
+    gb  <- suppressWarnings(glm(df$Accuracy ~ df$pred_sin[idx] + df$pred_cos[idx],
+                                family = binomial(link = "logit")))
+    cb  <- coef(gb)
+    A_null[iPerm] <- sqrt(cb[2]^2 + cb[3]^2)
+  }
+  A_floor[iSub]     <- mean(A_null, na.rm = TRUE)
+
+  A_corrected[iSub] <- A_obs[iSub] - A_floor[iSub]
+}
+
+# Combine evidence across subjects
+p_pvals <- ggplot(data.frame(logregress_ps = logregress_ps), aes(x = logregress_ps)) +
+  geom_histogram(bins = 25, fill = "grey60", colour = "black") +
+  labs(
+    title = "Distribution of p-values per Particuoant",
+    x     = "p-value",
+    y     = "Count"
+  )
+
+print(p_pvals)
+
+# Histogram of the corrected phase-modulation effect size (A_corrected)
+# A_corrected = observed sinusoidal amplitude minus the permutation null floor,
+# i.e. how much bigger each participant's modulation is than chance alone.
+p_effect <- ggplot(data.frame(A_corrected = A_corrected), aes(x = A_corrected)) +
+  geom_histogram(bins = 20, fill = "grey60", colour = "black") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey30") +
+  labs(
+    title    = "Distribution of Effect Sizes",
+    x        = "Effect Size",
+    y        = "Count"
+  )
+
+print(p_effect)
+
+# Save the accuracy-across-conditions plot, the p-value histogram, and the
+# effect-size histogram as .emf files (soft-coded path via here::here())
+ggsave(here("AccuracyAcrossConditions.emf"), plot = p_conditions, width = 7, height = 5, device = devEMF::emf)
+ggsave(here("PValueHistogram.emf"),          plot = p_pvals,      width = 7, height = 5, device = devEMF::emf)
+ggsave(here("EffectSizeHistogram.emf"),      plot = p_effect,     width = 7, height = 5, device = devEMF::emf)
+
+
+# One-sided Bayesian one-sample t-test: is the corrected amplitude above the null
+# floor (d > 0)? bf[1] is the "0 < d < Inf" slice vs the point null; 1 / bf[1] is
+# the evidence FOR the null against a positive effect (BF01).
+bf <- ttestBF(A_corrected, nullInterval = c(0, Inf))
+1 / bf[1]
+# Fisher's method: printing the poolr object shows the chi-square statistic, df and p
+comb_sin <- fisher(logregress_ps)
+cat("Sinusoidal phase effect (combined across people):\n"); print(comb_sin)
+comb_p   <- comb_sin$p
+
+#cat("Fixed-effects combined BF01:", combined_BF, "\n")
+```
+
+
+```{r Exploratory Analysis}
+
+## Correlate overall memory performance with the phase-modulation amplitude
+# Match by ID (not row position). Coerce ParticipantID to character on both
+# sides so the merge keys have the same type.
+ParticipantSummary$ParticipantID <- as.character(ParticipantSummary$ParticipantID)
+
+plot_df <- merge(
+  ParticipantSummary,
+  data.frame(ParticipantID = ParticipantIDs,
+             A_corrected   = A_corrected,
+             stringsAsFactors = FALSE),
+  by = "ParticipantID"
+)
+
+# remove zeros?
+# plot_df <- plot_df[plot_df$A_corrected > 0, ]
+
+plot_df$PropCorrect_z <- scale(plot_df$PropCorrect)[, 1]
+plot_df$A_corrected_z <- scale(plot_df$A_corrected)[, 1]
+
+# Correlation (r is scale-invariant, so raw and z give the same estimate)
+cor.test(plot_df$PropCorrect, plot_df$A_corrected)
+
+ggplot(plot_df, aes(PropCorrect_z, A_corrected_z)) +
+  geom_point(alpha = 0.5, colour = "black") +
+  geom_smooth(method = "lm", colour = "black", fill = "grey70") +
+  theme_bw(base_size = 13, base_family = "Arial")
+
+
+## Factor model: is any specific phase lag overall different from the others?
+# Exp4Data.model <- glmer(
+#   Accuracy ~ as.factor(Condition) + (1 | ClipID) + (1 | ParticipantID),
+#   data   = Exp4Data,
+#   family = binomial
+# )
+# 
+# Anova(Exp4Data.model)
+# summary(Exp4Data.model)
+# plot(predict_response(Exp4Data.model, terms = "Condition [all]"))
+# pairs(emmeans(Exp4Data.model, ~ Condition))
+
+
+Exp4Sum$Sine <- sin(Exp4Sum$Condition_rad)
+Exp4Sum$Cosine <- cos(Exp4Sum$Condition_rad)
+
+Exp4Sum$ParticipantID <- as.factor(Exp4Sum$ParticipantID)
+
+
+Exp4Sum.BFNull <- lmBF(
+  PropCorrect ~ ParticipantID,
+  data = Exp4Sum,
+  whichRandom = "ParticipantID"
+)
+
+Exp4Sum.BFFull <- lmBF(
+  PropCorrect ~ Sine + Cosine + ParticipantID,
+  data = Exp4Sum,
+  whichRandom = "ParticipantID"
+)
+
+
+Exp4Sum.BFNull/Exp4Sum.BFFull
+
+
+## Harmonics in a SINGLE per-person model (trial level) ───────────────────────
+# One logistic model per person holding the 4, 8, 12 and 16 Hz harmonics of the
+# fundamental as sin/cos pairs. Rather than testing each harmonic's pair one at
+# a time, we run a SINGLE joint Wald F-test across all four harmonics (all 8
+# sin/cos coefficients simultaneously, 8 df) to ask whether there is any
+# harmonic structure at all in a participant's phase-tuning curve. On 16
+# equally spaced phase bins these harmonics form an (approximately, under
+# balanced trials) orthogonal Fourier basis.
+# Harmonic h corresponds to h x 4 Hz (h = 1..4 -> 4, 8, 12, 16 Hz).
+Hz_labels <- c("4Hz", "8Hz", "12Hz", "16Hz")
+
+ps_harmonics_joint <- setNames(numeric(n_subj), ParticipantIDs)
+
+for (iSub in 1:n_subj) {
+  subj_data <- Exp4Data[Exp4Data$ParticipantID == ParticipantIDs[iSub], ]
+  subj_data <- subj_data[!is.na(subj_data$Accuracy), ]
+
+  th  <- subj_data$Condition_rad
+  dat <- data.frame(
+    Accuracy = as.numeric(as.character(subj_data$Accuracy)),
+    s1 = sin(1 * th), c1 = cos(1 * th),   # 4 Hz (fundamental)
+    s2 = sin(2 * th), c2 = cos(2 * th),   # 8 Hz
+    s3 = sin(3 * th), c3 = cos(3 * th),   # 12 Hz
+    s4 = sin(4 * th), c4 = cos(4 * th)    # 16 Hz
+  )
+
+  gfull <- suppressWarnings(glm(
+    Accuracy ~ s1 + c1 + s2 + c2 + s3 + c3 + s4 + c4,
+    data = dat, family = binomial(link = "logit")))
+
+  # Joint Wald F-test on all four harmonics' sin/cos pairs at once (8 df)
+  wald_joint <- linearHypothesis(
+    gfull,
+    c("s1 = 0", "c1 = 0", "s2 = 0", "c2 = 0", "s3 = 0", "c3 = 0", "s4 = 0", "c4 = 0"),
+    test = "F"
+  )
+  ps_harmonics_joint[iSub] <- wald_joint[2, "Pr(>F)"]
+}
+
+# Combine the joint per-participant p-values across participants (Fisher's
+# method); the printed poolr object shows the chi-square statistic, df and p
+# for the combined test of "any harmonic structure, all frequencies at once"
+comb_harmonics_joint <- fisher(ps_harmonics_joint[!is.na(ps_harmonics_joint)])
+cat("Combined harmonic effect (4, 8, 12, 16 Hz tested jointly):\n")
+print(comb_harmonics_joint)
+comb_p_harmonics_joint <- comb_harmonics_joint$p
+
+
+# ── Fitted phase tuning for participants with a significant Wald F-test ────────
+# Self-contained loop: refit each significant participant's sinusoidal logistic
+# model and plot the fitted tuning curves together, marking each peak angle.
+# Fitted curve: P(correct | theta) = plogis(b0 + b_sin*sin(theta) + b_cos*cos(theta)).
+# The sinusoid peaks where its derivative is zero, i.e. theta = atan2(b_sin, b_cos),
+# which is the participant's preferred (peak) phase angle.
+alpha_level <- 0.05
+sig_idx     <- which(logregress_ps < alpha_level)   # from the confirmatory chunk
+
+if (length(sig_idx) == 0) {
+  message("No participants with p < ", alpha_level, " in the Wald F-test.")
+} else {
+  theta_grid <- seq(-pi, pi, length.out = 400)
+  fit_long   <- data.frame()
+  peak_pts   <- data.frame()
+
+  for (j in sig_idx) {
+    subj_data <- Exp4Data[Exp4Data$ParticipantID == ParticipantIDs[j], ]
+    subj_data <- subj_data[!is.na(subj_data$Accuracy), ]
+
+    df <- data.frame(
+      Accuracy = as.numeric(as.character(subj_data$Accuracy)),
+      pred_sin = sin(subj_data$Condition_rad),
+      pred_cos = cos(subj_data$Condition_rad)
+    )
+
+    g1 <- glm(Accuracy ~ pred_sin + pred_cos, data = df,
+              family = binomial(link = "logit"))
+    b  <- coef(g1)                                       # intercept, sin, cos
+
+    # Fitted curve over the full circle
+    pfit <- plogis(b[1] + b[2] * sin(theta_grid) + b[3] * cos(theta_grid))
+    fit_long <- rbind(fit_long, data.frame(
+      ParticipantID = ParticipantIDs[j],
+      theta_deg     = theta_grid * 180 / pi,
+      pfit          = pfit
+    ))
+
+    # Peak (preferred) angle and its fitted accuracy
+    theta_peak <- atan2(b[2], b[3])
+    peak_pts <- rbind(peak_pts, data.frame(
+      ParticipantID = ParticipantIDs[j],
+      theta_deg     = theta_peak * 180 / pi,
+      pfit          = plogis(b[1] + b[2] * sin(theta_peak) + b[3] * cos(theta_peak))
+    ))
+  }
+
+  p_sig <- ggplot(fit_long, aes(theta_deg, pfit,
+                                colour = ParticipantID, linetype = ParticipantID)) +
+    geom_line(linewidth = 0.9, alpha = 0.85) +
+    geom_point(data = peak_pts, size = 3, show.legend = FALSE) +  # highlight peak angle
+    geom_text(data = peak_pts,
+              aes(label = paste0(round(theta_deg), "\u00b0")),
+              vjust = -0.9, size = 3, show.legend = FALSE) +
+    geom_hline(yintercept = 0.25, linetype = "dashed", colour = "grey50") +
+    scale_colour_grey(start = 0, end = 0.7) +
+    scale_x_continuous(breaks = seq(-180, 180, 45), limits = c(-180, 180)) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(
+      title    = paste0("Fitted phase tuning — significant participants (p < ",
+                        alpha_level, ", n = ", length(sig_idx), ")"),
+      subtitle = "Points mark each participant's peak (preferred) phase angle; dashed = chance",
+      x        = "Phase angle (degrees)",
+      y        = "Fitted P(correct)",
+      colour   = "Participant", linetype = "Participant"
+    )
+
+  print(p_sig)
+
+  # ── Radial plot of the preferred (peak) angles ──────────────────────────────
+  # Each significant participant is a point on the circle at their peak angle.
+  # The black arrow is the circular mean direction; its length is the resultant
+  # R (0 = angles spread evenly, 1 = perfectly aligned).
+  ang_rad  <- peak_pts$theta_deg * pi / 180
+  mean_dir <- atan2(mean(sin(ang_rad)), mean(cos(ang_rad)))
+  R_bar    <- sqrt(mean(sin(ang_rad))^2 + mean(cos(ang_rad))^2)
+
+  p_radial <- ggplot(peak_pts, aes(x = theta_deg, y = 1, colour = ParticipantID)) +
+    geom_segment(aes(xend = theta_deg, yend = 0), alpha = 0.35) +
+    geom_point(size = 4) +
+    annotate("segment",
+             x = mean_dir * 180 / pi, xend = mean_dir * 180 / pi,
+             y = 0, yend = R_bar,
+             colour = "black", linewidth = 1.3,
+             arrow = grid::arrow(length = grid::unit(0.3, "cm"))) +
+    scale_colour_grey(start = 0, end = 0.7) +
+    coord_polar(theta = "x", start = 0) +
+    scale_x_continuous(limits = c(-180, 180), breaks = seq(-180, 135, 45)) +
+    scale_y_continuous(limits = c(0, 1.15), breaks = NULL) +
+    labs(
+      title    = "Preferred (peak) phase angles",
+      subtitle = paste0("Black arrow = mean direction (", round(mean_dir * 180 / pi),
+                        "\u00b0), resultant R = ", round(R_bar, 2)),
+      x        = NULL, y = NULL, colour = "Participant"
+    )
+
+  print(p_radial)
+}
+```
