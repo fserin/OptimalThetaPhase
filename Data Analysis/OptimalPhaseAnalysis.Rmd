@@ -286,6 +286,49 @@ p_conditions <- ggplot(Exp4Sum, aes(x = Condition, y = PropCorrect,
 
 print(p_conditions)
 
+<<<<<<< HEAD
+# ── Plot: accuracy across conditions (mean +/- 95% CI shaded band) ───────────
+# Same underlying data as p_conditions, but summarised across participants per
+# condition and shown as a mean line with a shaded 95% CI ribbon instead of
+# individual participant lines.
+Exp4CondSummary <- Exp4Sum |>
+  group_by(Condition) |>
+  summarise(
+    Mean = mean(PropCorrect, na.rm = TRUE),
+    SD   = sd(PropCorrect, na.rm = TRUE),
+    n    = sum(!is.na(PropCorrect)),
+    .groups = "drop"
+  ) |>
+  mutate(
+    SE       = SD / sqrt(n),
+    CI_lower = Mean - qt(0.975, df = n - 1) * SE,
+    CI_upper = Mean + qt(0.975, df = n - 1) * SE
+  )
+
+p_conditions_ci <- ggplot(Exp4CondSummary, aes(x = Condition, y = Mean)) +
+  geom_ribbon(aes(ymin = CI_lower, ymax = CI_upper), fill = "grey70", alpha = 0.5) +
+  geom_line(colour = "black", linewidth = 1.2) +
+  geom_point(colour = "black", size = 2) +
+  geom_hline(yintercept = 0.25, linetype = "dashed", colour = "grey50") +
+  scale_x_continuous(breaks = unique(Exp4CondSummary$Condition)) +
+  scale_y_continuous(
+    breaks = sort(unique(c(seq(0.2, 0.55, by = 0.1), 0.25, 0.55))),
+    labels = scales::percent_format()
+  ) +
+  coord_cartesian(ylim = c(0.2, 0.55)) +
+  labs(
+    title    = "Memory Accuracy Across Phase Lags (chance level = 25%)",
+    subtitle = "Shaded band = 95% CI",
+    x        = "Phase Lags (degrees)",
+    y        = "Proportion Correct"
+  ) +
+  theme_minimal(base_size = 13, base_family = "Arial") +
+  theme(legend.position = "none", axis.title = element_text(size = 15))
+
+print(p_conditions_ci)
+
+=======
+>>>>>>> parent of f5dbc16 (Data Analysis update and AV sync analysis addition)
 # ── Per-subject sinusoidal logistic regression (test of phase modulation) ──────
 ParticipantIDs <- as.character(sort(as.numeric(unique(Exp4Data$ParticipantID))))
 n_subj         <- length(ParticipantIDs)
@@ -408,7 +451,52 @@ cor.test(plot_df$PropCorrect, plot_df$A_corrected)
 ggplot(plot_df, aes(PropCorrect_z, A_corrected_z)) +
   geom_point(alpha = 0.5, colour = "black") +
   geom_smooth(method = "lm", colour = "black", fill = "grey70") +
+<<<<<<< HEAD
+  labs(
+    title = "Overall Performance vs. Corrected Effect Size",
+    x     = "Overall Accuracy (z-scored)",
+    y     = "Corrected Effect Size (z-scored)"
+  ) +
+  theme_bw(base_size = 13, base_family = "Arial") +
+  theme(axis.text = element_text(size = 14), axis.title = element_text(size = 15))
+
+print(p_corr)
+
+ggsave(here("PerformanceEffectSizeCorrelation.emf"), plot = p_corr, width = 7, height = 5, device = devEMF::emf)
+
+## Robustness check: does the phase-modulation effect hold within just the
+## higher-performing half of the sample? Median-split on overall accuracy,
+## then re-run the main confirmatory test (one-sample Bayesian t-test on the
+## permutation-corrected effect size) restricted to the upper-half performers.
+## A_corrected is already computed per participant, independent of this split,
+## so we simply subset it rather than re-running the per-subject regressions.
+median_perf <- median(plot_df$PropCorrect, na.rm = TRUE)
+A_corrected_high <- plot_df$A_corrected[plot_df$PropCorrect >= median_perf]
+
+cat("High performers (upper half on overall accuracy, median =", round(median_perf, 3),
+    ", n =", length(A_corrected_high), "):\n")
+cat("Effect size: M =", round(mean(A_corrected_high, na.rm = TRUE), 3),
+    ", SD =", round(sd(A_corrected_high, na.rm = TRUE), 3), "\n")
+
+bf_high <- ttestBF(A_corrected_high, nullInterval = c(0, Inf))
+cat("One-sample Bayesian t-test (High performers only), effect size > 0:\n")
+print(bf_high)
+cat("BF01 =", round(1 / extractBF(bf_high[1])$bf, 3), "\n")
+
+# Fisher's combined test on the same high-performer subgroup, using each
+# participant's per-subject Wald F-test p-value (logregress_ps, matched to
+# ParticipantIDs by ID) from the confirmatory chunk.
+ps_high <- logregress_ps[match(plot_df$ParticipantID[plot_df$PropCorrect >= median_perf], ParticipantIDs)]
+
+comb_sin_high <- fisher(ps_high)
+cat("Sinusoidal phase effect, Fisher's combined test (High performers only):\n")
+print(comb_sin_high)
+cat("chi-square =", round(comb_sin_high$statistic, 3),
+    ", df =", attr(comb_sin_high$statistic, "df"),
+    ", p =", round(comb_sin_high$p, 4), "\n")
+=======
   theme_bw(base_size = 13, base_family = "Arial")
+>>>>>>> parent of f5dbc16 (Data Analysis update and AV sync analysis addition)
 
 
 ## Factor model: is any specific phase lag overall different from the others?
